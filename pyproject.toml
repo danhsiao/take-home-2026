@@ -7,4 +7,19 @@ requires-python = ">=3.12"
 dependencies = [
     "openai>=2.15.0",
     "python-dotenv>=1.0.0",
+    # Fast C-backed HTML parser. Chosen over BeautifulSoup because the PDPs here are
+    # 300-800KB each, and parse time is a real per-product cost at scale.
+    "selectolax>=0.3.21",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "golden: asserts against the cached extraction snapshot (requires running main.py first)",
 ]
