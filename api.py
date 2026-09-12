@@ -1,18 +1,4 @@
-"""HTTP API over the extracted catalogue.
-
-Serves the products produced by `main.py` from `out/products.json`. There is no
-database, per the assignment - the snapshot is loaded once at startup and held in
-memory, which is adequate for a catalogue of this size and keeps the deployment story
-to a single process.
-
-Exactly two endpoints, one per page the frontend needs: a catalogue grid and a product
-detail page. Filtering, sorting, faceting, and a live-extraction endpoint are all
-deliberately absent. The assignment asks for two pages and then says not to build
-features it did not ask for, and none of those are needed to render either page.
-
-Run with:
-    uv run uvicorn api:app --reload
-"""
+"""A small HTTP API over the extracted catalogue."""
 
 import json
 import logging
@@ -49,8 +35,8 @@ _BY_ID: dict[str, dict[str, Any]] = {}
 def _load() -> None:
     """Read the extraction snapshot into memory.
 
-    A missing file is not fatal: the API starts and reports an empty catalogue rather
-    than crashing, so the frontend can be developed before ingestion has been run.
+    A missing file is not an error. The API still starts and the shop shows an empty
+    state rather than failing.
     """
     global _CATALOGUE, _BY_ID
 
@@ -70,12 +56,7 @@ _load()
 
 
 def _summarise(product: dict[str, Any]) -> dict[str, Any]:
-    """Reduce a product to what a catalogue grid needs.
-
-    The grid omits the description, key features, and full variant list. On a real
-    catalogue that difference dominates response size, and the detail endpoint is one
-    request away.
-    """
+    """Cut a product down to what a catalogue grid needs."""
     return {
         "id": product["id"],
         "name": product["name"],
@@ -101,7 +82,7 @@ def list_products() -> dict[str, Any]:
 
 @app.get("/api/products/{product_id}")
 def get_product(product_id: str) -> dict[str, Any]:
-    """One product in full, including every variant and image."""
+    """One product in full, with every variant and image."""
     product = _BY_ID.get(product_id)
     if product is None:
         raise HTTPException(status_code=404, detail=f"No product with id {product_id}")

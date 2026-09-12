@@ -1,28 +1,8 @@
-"""The AI stage: pruned evidence -> ProductCandidate.
+"""The AI stage: cleaned evidence in, ProductCandidate out.
 
-Everything deterministic has already happened by the time this module runs. The model
-is not the scraper; it is the interpreter. It is asked to do the things that genuinely
-need judgement and cannot be derived from a specification:
-
-  * decide which of several conflicting titles is the canonical product name
-  * read variant dimensions out of an arbitrary state blob, including resolving
-    foreign-key references between SKU, price, and media records
-  * turn prose into discrete key features
-  * pick a category from a shortlist we retrieved for it
-
-It is NOT asked for image URLs, video URLs, GTINs, or a price that a structured offer
-already stated. Those come from `extract.py` and are merged in by `pipeline.py`, where
-deterministic facts take precedence. A model that never gets to state an image URL
-cannot mangle one.
-
-There is one call on the normal path. A second, cheap call fires only when category
-selection fails validation - and it receives just the failing field, the validation
-issues, and a freshly retrieved shortlist, never the page again.
-
-PROMPT COMPLIANCE: the prompts below contain no site names, no domains, and no
-examples drawn from `data/`. The only worked examples are invented ones illustrating
-the shape of a variant dimension, which is a statement about the output format rather
-than a hint about any page we were given.
+One call, and it only does interpretation: naming, brand, description, features,
+what the variant dimensions mean, and picking a category from a shortlist we give
+it.
 """
 
 import json
@@ -39,17 +19,10 @@ logger = logging.getLogger(__name__)
 
 
 class CategoryChoice(BaseModel):
-    """Response schema for the repair call, which answers one question only.
-
-    Kept as narrow as possible: a repair that could also rewrite the name or price
-    would let a cheap model overwrite fields that were already validated.
-    """
+    """The reply shape for the repair call, which answers one question."""
 
     category: str | None = None
-    # The repair must be able to decline. Forcing a choice from a shortlist that does
-    # not contain the right answer produces a category that *passes* validation while
-    # being wrong - which is worse than no answer, because nothing downstream can
-    # detect it. A declined repair fails the product explicitly instead.
+    # The repair must be able to decline. 
     fits: bool = True
 
 # The main call does the heavy interpretation and benefits from a stronger model.
@@ -57,9 +30,7 @@ PRIMARY_MODEL = "google/gemini-3-flash-preview"
 # The repair call answers a single multiple-choice question and does not need one.
 REPAIR_MODEL = "google/gemini-2.5-flash-lite"
 
-# Ceiling on the evidence packet handed to the model. Beyond this, additional context
-# reliably costs more than it adds, and cost per product is a first-class concern at
-# the scale this is meant to run at.
+# Ceiling on the evidence packet handed to the model.
 MAX_PACKET_CHARS = 90_000
 
 
@@ -117,11 +88,7 @@ Rules:
 
 
 def _compact(value: Any, limit: int) -> str:
-    """Serialise evidence compactly, truncating at a character budget.
-
-    Separators are stripped of whitespace because pretty-printed JSON spends a
-    meaningful share of its tokens on indentation, and the model does not need it.
-    """
+    # Serialise evidence compactly, cutting it off at a character budget.
     try:
         text = json.dumps(value, separators=(",", ":"), default=str)
     except (TypeError, ValueError):
@@ -132,16 +99,7 @@ def _compact(value: Any, limit: int) -> str:
 def build_packet(
     evidence: PageEvidence, facts: DeterministicFacts, candidates: list[str]
 ) -> str:
-    """Assemble the evidence packet sent to the model.
-
-    This function is the cost lever for the whole system. The raw pages average about
-    138,000 tokens; the packet this produces averages roughly a tenth of that, and the
-    difference is what makes per-product economics work at scale.
-
-    Evidence is ordered by trustworthiness so that the most reliable material is
-    nearest the instructions, and each section is separately budgeted so that one
-    enormous state blob cannot crowd out the visible text that another page depends on.
-    """
+    # Build the evidence packet we send the model, most trusted first.
     sections: list[str] = []
 
     if facts:
@@ -183,18 +141,7 @@ def build_packet(
 async def run(
     evidence: PageEvidence, facts: DeterministicFacts, candidates: list[str]
 ) -> ProductCandidate | None:
-    """Interpret the evidence into a ProductCandidate. One LLM call.
-
-    Args:
-        evidence: the deterministic harvest.
-        facts: high-confidence values already read from published standards.
-        candidates: the retrieved taxonomy shortlist.
-
-    Returns:
-        The model's interpretation, or None if the call failed outright. A None here
-        is a transport failure, not a data problem - a page the model could not read
-        still returns a populated candidate with null fields.
-    """
+    # Interpret the evidence into a ProductCandidate. One LLM call.
     packet = build_packet(evidence, facts, candidates)
 
     try:
@@ -229,23 +176,8 @@ Rules:
 async def repair_category(
     candidate: ProductCandidate, issues: list[ValidationIssue]
 ) -> str | None:
-    """Re-select a category after the first attempt failed validation. One cheap call.
+    # Pick the category again after the first try failed validation. One cheap call.
 
-    Repair is deliberately limited to `category`, because it is the only field where
-    asking again is the right response. Category has a closed vocabulary and a hard
-    validator, so a failure is usually a formatting or shortlist problem that a second
-    look genuinely fixes.
-
-    Nothing else is repaired. If the model returned an image URL that is not in the
-    evidence, the correct action is to drop that URL, not to ask for another guess -
-    re-asking would just resample the same distribution that produced the error.
-
-    The shortlist is rebuilt from the model's own `category_keywords` rather than
-    merely widened. When the first retrieval missed because the page's vocabulary
-    differs from the taxonomy's, widening the same query returns more of the same wrong
-    branch; re-querying with the model's plain-language nouns actually reaches the
-    right one.
-    """
     query = " ".join(candidate.category_keywords) if candidate.category_keywords else ""
     if not query:
         # No keywords to re-query with, so fall back to widening the original signal.

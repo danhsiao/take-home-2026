@@ -6,18 +6,6 @@ calls, so the fast suite stays free and deterministic. Regenerate the snapshot w
     uv run python main.py
 
 Run these with `uv run pytest -m golden`.
-
-Two rules govern what is asserted here, both of them about not fooling ourselves:
-
-  1. PAGE-SPECIFIC EXPECTATIONS LIVE ONLY IN TESTS. Nothing in this file may leak into
-     the extractor. The production code must stay generic, so the moment a value here
-     would need a corresponding branch in `extract.py`, the design is wrong.
-
-  2. ASSERT STABLE FACTS, NOT GENERATED PROSE. Name, brand, price, currency, category,
-     identifiers, and variant relationships are properties of the page and will not
-     drift. Descriptions and key features are model-authored and legitimately vary
-     between runs; asserting their wording would produce a suite that fails for no
-     reason and trains everyone to ignore it.
 """
 
 import json
@@ -239,6 +227,113 @@ def test_article_images_are_full_resolution(catalogue):
     for url in sized:
         width = int(url.split("w=")[1].split("&")[0])
         assert width >= 1000, f"low-resolution rendition emitted: {url}"
+
+
+@pytest.mark.parametrize(
+    "source,maximum",
+    [
+        ("ace.html", 8),
+        ("adaysmarch.html", 8),
+        ("article.html", 14),
+        ("llbean.html", 15),
+        ("nike.html", 10),
+    ],
+)
+def test_image_precision(catalogue, source, maximum):
+    """Recall has an upper bound too.
+
+    A gallery several times the size of the real one means the harvest is picking up
+    swatches, marketing assets or a neighbouring product - which reads as a bug on the
+    product page even though every individual URL resolves.
+    """
+    assert len(catalogue[source]["image_urls"]) <= maximum
+
+
+def test_no_interface_assets_in_galleries(catalogue):
+    """Icons, chevrons and badges ship as SVG; photographs do not."""
+    for source, product in catalogue.items():
+        svg = [url for url in product["image_urls"] if ".svg" in url.lower()]
+        assert not svg, f"{source}: interface assets in gallery: {svg}"
+
+
+def test_thumbnail_renditions_only_appear_when_nothing_larger_exists(catalogue):
+    """A small rendition is a gallery image only when the page exposes no larger one.
+
+    The rule used to be absolute: no rendition below `MIN_PRODUCT_WIDTH`, ever. That
+    holds on a server-rendered page, where the markup carries the real gallery. It
+    fails on a client-rendered one, where the markup carries a thumbnail and
+    JavaScript swaps in the full-size image at runtime - the largest URL the saved
+    HTML contains *is* a thumbnail. Enforcing the minimum there deletes the merchant's
+    entire gallery for being small rather than for being wrong, leaving only the
+    nominated hero.
+
+    So the minimum still runs first and unmodified, and small renditions are admitted
+    only by the fallback in `images.collect`: the strict pass left no gallery at all,
+    while the product's own region visibly renders photographs. This test asserts that
+    narrower property - a page that keeps a full-size gallery must not also carry
+    thumbnails of it.
+    """
+    import images
+
+    for source, product in catalogue.items():
+        urls = product["image_urls"]
+        widths = [images._effective_width(url) for url in urls]
+        small = [
+            url
+            for url, width in zip(urls, widths)
+            if width is not None and width < images.MIN_PRODUCT_WIDTH
+        ]
+        if not small:
+            continue
+        # Admitted only as a whole-gallery fallback, never mixed in beside full-size
+        # photography of the same product.
+        full_size = [
+            url
+            for url, width in zip(urls, widths)
+            if width is not None and width >= images.MIN_PRODUCT_WIDTH
+        ]
+        assert len(full_size) <= 1, (
+            f"{source}: thumbnails emitted alongside a full-size gallery: {small}"
+        )
+
+
+def test_galleries_stay_within_the_merchant_image_host(catalogue):
+    """Every image is served by the same host the merchant nominated its hero from.
+
+    Marketing banners, review photos and analytics beacons live elsewhere, and
+    "elsewhere" is what separates them from product photography.
+
+    This asserts the *host*, not the asset root. It previously asserted a single asset
+    root, which turned out to encode an assumption that is simply not true of the web:
+    a merchant may publish its nominated sharing image through one route
+    (`/seo/<slug>.jpg`) and serve the gallery from a delivery route
+    (`/asr/<uuid>.jpg`). Both are that merchant's product photography. One of the
+    pages in `data/` does exactly this, and under the old assertion the only way to
+    pass was to discard its entire real gallery and keep the cross-sell thumbnails
+    that happened to share the sharing route - which is what the extractor used to do.
+
+    The host is the part that genuinely distinguishes the merchant's own imagery from
+    a third party's, so that is what is asserted now.
+    """
+    from urllib.parse import urlparse
+
+    for source, product in catalogue.items():
+        hosts = {urlparse(url).netloc.lower() for url in product["image_urls"]}
+        assert len(hosts) == 1, f"{source}: images span several hosts: {hosts}"
+
+
+def test_gallery_presents_one_configuration(catalogue):
+    """This page embeds a second item code's full-size photography.
+
+    Its Tall cut is filed under its own item number, and its photographs are the same
+    shots re-registered under that number. Both sets are full resolution on the same
+    host in the same folder, so only the id separates them - which makes this the
+    regression test for the id gate. The Tall combinations keep their own imagery on
+    their variant rows.
+    """
+    urls = catalogue["llbean.html"]["image_urls"]
+    foreign = [url for url in urls if "224625" in url]
+    assert not foreign, f"sibling product imagery leaked in: {foreign}"
 
 
 def test_no_cross_sell_images_in_primary_product(catalogue):

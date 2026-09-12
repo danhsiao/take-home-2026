@@ -1,10 +1,4 @@
 """Unit tests for deterministic extraction.
-
-Every fixture is hand-written synthetic HTML. Nothing is copied from `data/`, because
-a test built from the provided pages measures whether we memorised those pages rather
-than whether the rules generalise - and the solution is graded on unseen sites.
-
-No API calls, no network.
 """
 
 import extract
@@ -274,6 +268,134 @@ def test_chrome_images_are_filtered_from_untrusted_sources():
     urls = [asset.url for asset in extract.run(html).images]
     assert "https://cdn.test/i/product.jpg" in urls
     assert all("logo" not in url for url in urls)
+
+
+# --------------------------------------------------------------------------------
+# Images: relevance filtering
+# --------------------------------------------------------------------------------
+
+
+def _page(body: str, anchor: str = "https://cdn.test/shop/img/9000_0_1.jpg") -> str:
+    """A PDP whose merchant-nominated product image is `anchor`."""
+    return f"""
+    <html><head><link rel="canonical" href="https://x.test/p">
+    <meta property="og:image" content="{anchor}">
+    </head><body>{body}</body></html>
+    """
+
+
+def test_svg_assets_are_not_product_photography():
+    """Interface chrome is shipped as SVG; product photography never is."""
+    html = _page("""
+      <img src="https://cdn.test/shop/img/heart-inactive.svg">
+      <img src="https://cdn.test/shop/img/9000_0_2.jpg">
+    """)
+    urls = [asset.url for asset in extract.run(html).images]
+    assert "https://cdn.test/shop/img/9000_0_2.jpg" in urls
+    assert all(not url.endswith(".svg") for url in urls)
+
+
+def test_tiny_declared_renditions_are_dropped():
+    """A 65px rendition is a swatch, not a gallery image."""
+    html = _page("""
+      <img src="https://cdn.test/shop/img/9000_0_2.jpg?wid=65">
+      <img src="https://cdn.test/shop/img/9000_0_3.jpg?wid=1200">
+    """)
+    urls = [asset.url for asset in extract.run(html).images]
+    assert "https://cdn.test/shop/img/9000_0_3.jpg?wid=1200" in urls
+    assert all("wid=65" not in url for url in urls)
+
+
+def test_an_asset_offering_both_sizes_keeps_the_large_one():
+    """The size gate runs after resolution selection, never before it."""
+    html = _page("""
+      <img src="https://cdn.test/shop/img/9000_0_2.jpg?wid=65">
+      <img src="https://cdn.test/shop/img/9000_0_2.jpg?wid=1200">
+    """)
+    urls = [asset.url for asset in extract.run(html).images]
+    assert "https://cdn.test/shop/img/9000_0_2.jpg?wid=1200" in urls
+
+
+def test_bounding_parameters_are_read_only_for_filtering():
+    """`?max=` identifies a thumbnail, but must not outrank an unbounded original.
+
+    Reading it as a width would make the bounded rendition win selection, and the
+    full-resolution URL - whose width the page never states - would be discarded.
+    """
+    html = _page("""
+      <img src="https://cdn.test/shop/img/9000_0_2.jpg">
+      <img src="https://cdn.test/shop/img/9000_0_2.jpg?max=100">
+      <img src="https://cdn.test/shop/img/9000_0_9.jpg?max=100">
+    """)
+    urls = [asset.url for asset in extract.run(html).images]
+    assert "https://cdn.test/shop/img/9000_0_2.jpg" in urls
+    assert all("9000_0_9" not in url for url in urls)
+
+
+def test_images_from_another_asset_root_are_dropped():
+    """Marketing banners and UI assets live outside the product image store."""
+    html = _page("""
+      <img src="https://cdn.test/shop/img/9000_0_2.jpg">
+      <img src="https://cdn.test/marketing/banners/free-shipping-truck.png">
+      <img src="https://reviews.other.test/Product/1/2/square.jpg">
+    """)
+    urls = [asset.url for asset in extract.run(html).images]
+    assert urls == [
+        "https://cdn.test/shop/img/9000_0_1.jpg",
+        "https://cdn.test/shop/img/9000_0_2.jpg",
+    ]
+
+
+def test_another_configurations_photography_is_dropped():
+    """Same host, same folder, full resolution - but a different item number.
+
+    In practice this is the same photography re-registered under a neighbouring
+    configuration's id. The gallery presents one configuration; the variant rows keep
+    the association for the others.
+    """
+    html = _page("""
+      <img src="https://cdn.test/shop/img/9000_0_2.jpg">
+      <img src="https://cdn.test/shop/img/9001_0_1.jpg">
+      <img src="https://cdn.test/shop/img/9001_0_2.jpg">
+    """)
+    urls = [asset.url for asset in extract.run(html).images]
+    assert "https://cdn.test/shop/img/9000_0_2.jpg" in urls
+    assert all("/9001_" not in url for url in urls)
+
+
+def test_ids_of_a_different_shape_are_left_alone():
+    """The id gate only compares like with like; it is not a numeric prefix ban."""
+    html = _page("""
+      <img src="https://cdn.test/shop/img/12_detail.jpg">
+      <img src="https://cdn.test/shop/img/photo-900.jpg">
+    """)
+    urls = [asset.url for asset in extract.run(html).images]
+    assert "https://cdn.test/shop/img/12_detail.jpg" in urls
+    assert "https://cdn.test/shop/img/photo-900.jpg" in urls
+
+
+def test_pages_without_a_nominated_image_are_not_filtered_by_family():
+    """With no anchor there is no reference point, so recall must not be narrowed."""
+    html = """
+    <html><head><link rel="canonical" href="https://x.test/p"></head><body>
+      <img src="https://cdn.test/shop/img/9000_0_2.jpg">
+      <img src="https://other.test/whatever/photo.jpg">
+    </body></html>
+    """
+    urls = [asset.url for asset in extract.run(html).images]
+    assert len(urls) == 2
+
+
+def test_filtering_never_empties_a_gallery():
+    """If every gate rejects everything, the unfiltered harvest is returned.
+
+    A page we cannot reason about should degrade to raw recall, not to no images.
+    """
+    anchor = "https://cdn.test/shop/img/9000_0_1.jpg?wid=65"
+    html = _page(
+        '<img src="https://elsewhere.test/x/y/z.jpg?wid=20">', anchor=anchor
+    )
+    assert extract.run(html).images
 
 
 # --------------------------------------------------------------------------------

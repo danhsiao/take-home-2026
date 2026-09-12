@@ -1,13 +1,4 @@
 """Adversarial tests for the runtime validator.
-
-Each test is named for a FAILURE CLASS, not for a merchant. That is deliberate: the
-production code must stay generic, so the test suite must not encode knowledge of any
-particular site either. Every fixture here is hand-written and synthetic - nothing is
-copied out of `data/`, because a test built from the provided pages would pass by
-memorising them rather than by exercising a rule.
-
-These run with no API calls and no network, because `validate_candidate` is a pure
-function. That is what makes it cheap to assert on every failure mode we care about.
 """
 
 import pytest

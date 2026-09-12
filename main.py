@@ -1,14 +1,4 @@
-"""Batch ingestion CLI: reads the HTML in `data/`, writes `out/products.json`.
-
-Also prints the metrics that justify the architecture - tokens and cost per product,
-and a count of every validation issue raised. Those two numbers are the ones worth
-watching: the first says whether the system is economical at scale, the second says
-whether it is telling the truth.
-
-Usage:
-    uv run python main.py              # process every page in data/
-    uv run python main.py data/x.html  # process specific pages
-"""
+"""Batch CLI. Reads the HTML in `data/` and writes `out/products.json`."""
 
 import asyncio
 import json
@@ -31,7 +21,7 @@ OUTPUT_FILE = OUTPUT_DIR / "products.json"
 
 
 async def process(path: Path) -> ExtractionResult:
-    """Run one page through the pipeline, never raising."""
+    """Run one page through the pipeline. Never raises."""
     html = path.read_text(encoding="utf-8", errors="replace")
     result = await pipeline.run_html(html)
     result.source = result.source or path.name
@@ -39,7 +29,7 @@ async def process(path: Path) -> ExtractionResult:
 
 
 async def main(paths: list[Path]) -> int:
-    """Process pages concurrently and report. Returns a shell exit code."""
+    """Process pages at the same time and report. Returns a shell exit code."""
     if not paths:
         logger.error("No HTML files found in %s", DATA_DIR)
         return 1
@@ -69,7 +59,7 @@ async def main(paths: list[Path]) -> int:
 
 
 def _report(results: list[ExtractionResult]) -> None:
-    """Print per-page outcomes and the aggregate issue counts."""
+    """Print what happened per page, plus the totals for each issue type."""
     print("\n" + "=" * 78)
     print(f"{'page':<20}{'status':<10}{'variants':>9}{'images':>8}  category")
     print("-" * 78)

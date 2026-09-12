@@ -1,57 +1,25 @@
-"""Deterministic evidence harvesting: raw HTML -> PageEvidence.
+"""Pulls evidence out of raw HTML and returns a PageEvidence.
 
-This is the first and largest stage of the pipeline, and it runs before any model is
-involved. Its job is *recall*: find every place the page might have stated a product
-fact, and hand them onward. It deliberately does not decide what anything means,
-except where a published standard already decided for us.
-
-Four evidence surfaces are harvested, in descending order of trustworthiness:
-
-1. schema.org JSON-LD          - semantics defined by a spec
-2. microdata + OpenGraph/meta  - semantics defined by a spec
-3. embedded application JSON   - shape is arbitrary, so we prune rather than interpret
-4. visible text                - last resort, ranked by proximity to the page title
-
-THE COMPLIANCE LINE (the rule this whole module is built around):
-discovering a JSON blob generically - a `<script type="application/ld+json">`, a
-`<script type="application/json">`, a `window.__X__ = {...}` assignment - is
-*framework* generic and fine, because those are conventions of Next.js/Redux/Apollo
-and of the schema.org and OpenGraph specs, not of any merchant. Navigating a
-discovered blob by a known path (`data["product"]["skus"][0]["price"]`) would be
-site-specific and is forbidden. So: we locate structures by SHAPE, never by PATH, and
-we never branch on a domain name.
-
-Image collection lives in `images.py`; this module supplies it with the parsed tree,
-the product-typed JSON-LD items, and the pruned subtrees.
+The rule this module follows: finding a structure generically is fine, but reaching
+into it by a known path like `data["product"]["skus"][0]` is not. We find things by
+shape, and nothing branches on a domain name.
 """
 
 import json
 import re
 from typing import Any
 
+from urllib.parse import urljoin
+
 from selectolax.parser import HTMLParser
 
+import controls
+import identity as identity_mod
 import images
-from models import PageEvidence
+from identity import PageIdentity
+from models import PageEvidence, VariantRecord
 
-# --------------------------------------------------------------------------------
-# Budgets.
-#
-# These bound how much evidence we forward to the model, which is the single biggest
-# lever on token cost - and the entire justification for this architecture over
-# "send the page to a big model". They are not arbitrary: they were set by measuring
-# the qualifying-subtree size distribution across the provided PDPs. See the README
-# cost table.
-#
-# The important property is that they prune NOISE rather than truncate SIGNAL. An
-# oversized product record is decomposed or denoised, never silently dropped - an
-# earlier cut of this module discarded a 70KB subtree and produced *zero* evidence for
-# the one page that has no JSON-LD at all.
-# --------------------------------------------------------------------------------
-
-# Sized from measurement, not guesswork. The largest atomic product record across the
-# provided PDPs denoises to ~59K chars, so the per-subtree cap sits just above that:
-# below it, that page's only evidence would be discarded or shattered into fragments.
+# Budgets bounding how much evidence reaches the model - the biggest lever on token cost. 
 MAX_SUBTREE_CHARS = 64_000  # largest single coherent subtree we will keep whole
 MAX_TOTAL_SUBTREE_CHARS = 64_000  # ceiling across all subtrees for one page
 MAX_JSON_SUBTREES = 16
@@ -61,27 +29,24 @@ MAX_TEXT_BLOCKS = 200
 MAX_TEXT_BLOCK_CHARS = 2_000  # generous: product descriptions are legitimately long
 
 # A region is navigation/recommendations when this share of its text is link text.
-# Menus and carousels sit near 0.9; a product body sits near 0.05, so the threshold is
-# not delicate.
+# Menus sit near 0.9 and a product body near 0.05, so the threshold is not delicate.
 LINK_DENSITY_THRESHOLD = 0.6
-# Below this, the density ratio is computed over too few characters to be meaningful.
-# Kept low because compact recommendation strips ("Alpha | Beta | Gamma") are common
-# and genuinely short - a high threshold lets exactly the wrong content through.
+# Below this the ratio is computed over too few characters to mean anything. Kept low:
+# compact recommendation strips are common and genuinely short.
 MIN_LINK_FARM_CHARS = 20
 
-# Tags whose text is a meaningful standalone unit. Generic HTML semantics.
+# Generic HTML semantics.
 BLOCK_TAGS = {
     "p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "td", "th", "dd", "dt",
     "figcaption", "blockquote", "span", "div", "label", "button", "option", "a",
 }
 
-# Tags that never contain product information.
+# Tags that never contain product information (from my experience at Expedia Group and Research)
 SKIP_TAGS = {"script", "style", "noscript", "svg", "template", "iframe", "head"}
 
-# Attribute recording an element's distance from the product title. Set on the tree
-# for the same reason as `images.SKIP_ATTR`: selectolax node ids are not stable across
-# accesses, so the tree is the only durable place to record a structural annotation.
-TITLE_DEPTH_ATTR = "data-evidence-title-depth"
+# An element's distance from the product title, recorded on the tree itself because
+# selectolax node ids are not stable across accesses.
+TITLE_DEPTH_ATTR = images.TITLE_ATTR
 
 
 # --------------------------------------------------------------------------------
@@ -90,16 +55,9 @@ TITLE_DEPTH_ATTR = "data-evidence-title-depth"
 
 
 def run(html: str, url: str | None = None) -> PageEvidence:
-    """Harvest all deterministic evidence from a raw HTML string.
+    """Harvest every deterministic fact from a page of HTML.
 
-    Args:
-        html: the raw page source, exactly as fetched.
-        url: the page URL if known. Used only as a fallback for the canonical URL and
-            to recognise links pointing away from this product; never branched on.
-
-    Returns:
-        A PageEvidence containing everything we found. Fields may legitimately be
-        empty - a page with no structured data is a normal, expected input.
+    `url` is only a fallback for the canonical link. Empty fields are normal, not a bug.
     """
     tree = HTMLParser(html)
 
@@ -107,35 +65,95 @@ def run(html: str, url: str | None = None) -> PageEvidence:
     structured = _parse_jsonld(html)
     canonical = meta.get("canonical") or meta.get("og:url") or url
 
-    # Marks the tree once, in place. Both text and image harvesting need to know which
-    # DOM regions are navigation or recommendation strips rather than product content.
+    # Marks the tree once, in place. 
     _mark_link_farms(tree, canonical)
+    # Marks the chain from the product title up to the root. Text ranking uses it for
+    # proximity; image relevance uses it to know where this product's own region ends.
+    _mark_title_ancestors(tree, meta)
 
-    # Parsed once, then used two different ways. `json_subtrees` is a *budgeted*
-    # selection for the model, because context costs money. Image harvesting gets the
-    # full set of blobs instead: image URLs are never sent to the model, so there is no
-    # token reason to ration them, and rationing them actively loses galleries - an
-    # oversized product record gets decomposed for budget reasons, and its own media
-    # can drop out while smaller sibling records survive.
+    # Parsed once, used two ways: `json_subtrees` is budgeted for the model, while
+    # image harvesting gets every blob - image URLs never reach the model, so rationing
+    # them saves no tokens and loses galleries.
     json_blobs = _find_json_blobs(html)
-    json_subtrees = _select_subtrees(json_blobs)
+
+    # Who this document says it is. Built before any blob is read, because it is what
+    # decides whether a blob is about this page at all.
+    page_identity = _build_identity(meta, structured, canonical)
+
+    # A payload declaring another route is stale or foreign state - a leftover SPA
+    # payload, a redirect, an interstitial. Its products are *real* products, which is
+    # exactly why nothing downstream can tell them from this one by shape.
+    trusted_blobs = [
+        blob
+        for blob in json_blobs
+        if not identity_mod.blob_describes_another_page(blob, page_identity)
+    ]
+    stale_blobs = len(json_blobs) - len(trusted_blobs)
+
+    json_subtrees = _select_subtrees(trusted_blobs)
+
+    # Resolved before images, because a page that publishes a variant graph thereby
+    # publishes an inventory of its own product photography, and image harvesting is
+    # better off knowing it.
+    variant_graph = harvest_variant_graph(trusted_blobs, canonical)
 
     return PageEvidence(
         url=canonical,
         structured=structured,
         microdata=_parse_microdata(tree),
         meta=meta,
-        breadcrumbs=_parse_breadcrumbs(structured, tree),
+        breadcrumbs=_parse_breadcrumbs(structured, tree, canonical),
         json_subtrees=json_subtrees,
         text_blocks=_harvest_text_blocks(tree, meta),
         images=images.collect(
             tree=tree,
             product_items=find_typed(structured, "Product", "ProductGroup"),
             meta=meta,
-            json_subtrees=json_blobs,
+            json_subtrees=trusted_blobs,
             base_url=canonical,
+            declared_media=[url for row in variant_graph for url in row.image_urls],
+            identity=page_identity,
         ),
         videos=_harvest_videos(tree, structured, meta),
+        variant_graph=variant_graph,
+        # The only evidence surface that survives client-side rendering: when a page
+        # fetches its options over an API, the accessibility tree is all that remains.
+        option_groups=controls.harvest(tree, canonical),
+        identity_ids=sorted(page_identity.ids),
+        stale_blobs=stale_blobs,
+    )
+
+
+def _build_identity(
+    meta: dict[str, str],
+    structured: list[dict[str, Any]],
+    canonical: str | None,
+) -> PageIdentity:
+    #Collect what this page says its own identity is.
+    extra: set[str] = set()
+    for key in ("og:url", "twitter:url", "al:web:url"):
+        if value := meta.get(key):
+            extra |= identity_mod.id_tokens(value)
+
+    for item in find_typed(structured, "Product", "ProductGroup"):
+        for key, value in item.items():
+            if not isinstance(key, str):
+                continue
+            lowered = key.lower().replace("_", "").replace("-", "")
+            if lowered in {"@id", "id", "sku", "productid", "mpn", "url"} or lowered.startswith(
+                "gtin"
+            ):
+                extra |= identity_mod.id_tokens(value)
+            elif lowered == "offers":
+                # An Offer carries the purchasable identity (`sku`, `gtin13`) on many pages
+                for offer in value if isinstance(value, list) else [value]:
+                    if isinstance(offer, dict):
+                        extra |= identity_mod.record_identity(offer)
+
+    return PageIdentity(
+        canonical_url=canonical,
+        extra_ids=extra,
+        title=meta.get("og:title") or meta.get("title"),
     )
 
 
@@ -145,15 +163,10 @@ def run(html: str, url: str | None = None) -> PageEvidence:
 
 
 def _parse_jsonld(html: str) -> list[dict[str, Any]]:
-    """Extract and flatten every schema.org JSON-LD item on the page.
+    """Find and flatten every schema.org JSON-LD block on the page.
 
-    JSON-LD legitimately appears in several shapes - a bare object, an array of
-    objects, or an object wrapping an `@graph` list - so all three are normalised into
-    one flat list of typed items. We also recurse into `hasVariant`, so a
-    ProductGroup's nested Products surface as items in their own right.
-
-    Malformed blocks are skipped silently: a broken analytics blob elsewhere on the
-    page is not a reason to fail the whole extraction.
+    We scan the raw text instead of walking the DOM, which copes better with `</` inside
+    script bodies.
     """
     items: list[dict[str, Any]] = []
 
@@ -174,7 +187,7 @@ def _parse_jsonld(html: str) -> list[dict[str, Any]]:
 
 
 def _flatten_jsonld(node: Any, out: list[dict[str, Any]]) -> None:
-    """Recursively flatten JSON-LD containers into a flat list of typed items."""
+    """Flatten JSON-LD containers into one flat list of typed items."""
     if isinstance(node, list):
         for child in node:
             _flatten_jsonld(child, out)
@@ -190,18 +203,20 @@ def _flatten_jsonld(node: Any, out: list[dict[str, Any]]) -> None:
     if "@type" in node:
         out.append(node)
 
-    # Surface nested Products (a ProductGroup's `hasVariant` entries) as first-class
-    # items too, so downstream code finds them without knowing the nesting depth.
-    for key in ("hasVariant", "isSimilarTo", "isRelatedTo"):
-        if key in node:
-            _flatten_jsonld(node[key], out)
+    # A ProductGroup's `hasVariant` entries are configurations *of this product*
+    if "hasVariant" in node:
+        _flatten_jsonld(node["hasVariant"], out)
+
+    # schema.org defines `breadcrumb` as a property of `WebPage` holding a
+    # `BreadcrumbList`, and pages commonly nest it there. 
+    if "breadcrumb" in node:
+        _flatten_jsonld(node["breadcrumb"], out)
 
 
 def find_typed(items: list[dict[str, Any]], *types: str) -> list[dict[str, Any]]:
-    """Return JSON-LD items whose `@type` matches any of `types`.
+    """Return the JSON-LD items whose `@type` matches any of `types`.
 
-    `@type` may be a string or a list of strings, and either a bare name or a full
-    schema.org URL, so every form is normalised before comparison.
+    `@type` can be a string or a list, and a bare name or a full URL. All forms work.
     """
     wanted = {t.lower() for t in types}
     found = []
@@ -224,16 +239,7 @@ def find_typed(items: list[dict[str, Any]], *types: str) -> list[dict[str, Any]]
 
 
 def _parse_microdata(tree: HTMLParser) -> list[dict[str, Any]]:
-    """Extract microdata itemscopes as flat property maps.
-
-    Microdata is the older schema.org serialisation and is still common. Each
-    `itemscope` element's `itemprop` descendants are collected into a dict, keeping
-    `itemtype` so consumers can tell a Product from a BreadcrumbList.
-
-    Nested itemscopes are flattened rather than modelled precisely: a flat map is
-    enough to recover prices and identifiers, which is realistically all microdata
-    carries.
-    """
+    """Read microdata itemscopes as flat property maps."""
     scopes: list[dict[str, Any]] = []
 
     for node in tree.css("[itemscope]"):
@@ -261,15 +267,42 @@ def _parse_microdata(tree: HTMLParser) -> list[dict[str, Any]]:
         if len(props) > 1:  # more than just the @type we injected
             scopes.append(props)
 
+    unscoped = _unscoped_itemprops(tree)
+    if unscoped:
+        scopes.append(unscoped)
+
     return scopes
 
 
-def _microdata_value(node) -> str | None:
-    """Read a microdata property value from the attribute its element type implies.
+def _unscoped_itemprops(tree: HTMLParser) -> dict[str, Any]:
+    """Gather `itemprop` elements with no `itemscope` around them, as one item."""
+    props: dict[str, Any] = {}
 
-    The spec puts the value in `content` for meta, `href` for links, `src` for media,
-    `datetime` for time, and the text content otherwise.
-    """
+    for node in tree.css("[itemprop]"):
+        name = node.attributes.get("itemprop")
+        if not name or name in props or _within_itemscope(node):
+            continue
+        value = _microdata_value(node)
+        if value:
+            props[name] = value
+
+    return props
+
+
+def _within_itemscope(node) -> bool:
+    """Is this element already inside a declared item?"""
+    current = node.parent
+    hops = 0
+    while current is not None and hops < 25:
+        if current.attributes.get("itemscope") is not None:
+            return True
+        current = current.parent
+        hops += 1
+    return False
+
+
+def _microdata_value(node) -> str | None:
+    """Read a microdata value from whichever attribute the tag implies."""
     attrs = node.attributes
     for attr in ("content", "datetime"):
         if attrs.get(attr):
@@ -283,11 +316,7 @@ def _microdata_value(node) -> str | None:
 
 
 def _parse_meta(tree: HTMLParser) -> dict[str, str]:
-    """Collect OpenGraph, Twitter Card, and plain meta tags, plus the canonical link.
-
-    OpenGraph is a published standard, so `og:title` and `og:image` carry real
-    semantics we are entitled to rely on - unlike, say, a CSS class name.
-    """
+    """Collect OpenGraph, Twitter and plain meta tags, plus the canonical link."""
     meta: dict[str, str] = {}
 
     for node in tree.css("meta"):
@@ -310,17 +339,13 @@ def _parse_meta(tree: HTMLParser) -> dict[str, str]:
     return meta
 
 
-def _parse_breadcrumbs(structured: list[dict[str, Any]], tree: HTMLParser) -> list[str]:
-    """Recover the page's breadcrumb trail.
+def _parse_breadcrumbs(
+    structured: list[dict[str, Any]],
+    tree: HTMLParser,
+    canonical: str | None = None,
+) -> list[str]:
+    #Find the page's breadcrumb trail, the best category hint a PDP gives us.
 
-    Breadcrumbs are the single strongest taxonomy signal a PDP offers - the merchant's
-    own categorisation of the product - and they feed the taxonomy retrieval query
-    directly.
-
-    schema.org `BreadcrumbList` is preferred because its meaning is specified. Only if
-    that is absent do we fall back to the ARIA `breadcrumb` landmark, which is an
-    accessibility standard rather than a site-specific selector.
-    """
     for item in find_typed(structured, "BreadcrumbList"):
         elements = item.get("itemListElement")
         if not isinstance(elements, list):
@@ -337,24 +362,66 @@ def _parse_breadcrumbs(structured: list[dict[str, Any]], tree: HTMLParser) -> li
         if names:
             return names
 
-    # Fallback: the ARIA breadcrumb landmark, defined by the ARIA spec and used across
-    # the web, so this is a standard rather than a merchant selector.
-    for selector in ('nav[aria-label*="readcrumb"]', '[class*="readcrumb"]'):
-        node = tree.css_first(selector)
-        if not node:
-            continue
+    # The microdata serialisation of the same specified vocabulary.
+    for node in tree.css('[itemtype$="BreadcrumbList" i]'):
         names = [
-            (link.text() or "").strip()
-            for link in node.css("a, li")
-            if (link.text() or "").strip()
+            text
+            for element in node.css('[itemprop="name"]')
+            if (text := (element.attributes.get("content") or element.text() or "").strip())
         ]
-        # Nested li>a markup produces repeats; dedupe while preserving order.
-        seen: set[str] = set()
-        ordered = [n for n in names if not (n in seen or seen.add(n))]
-        if ordered:
-            return ordered[:10]
+        if names:
+            return _dedupe_trail(names)
+
+    if trail := _trail_by_path_prefix(tree, canonical):
+        return trail
+
+    for node in tree.css(
+        'nav[aria-label*="readcrumb" i], [role="navigation"][aria-label*="readcrumb" i]'
+    ):
+        names = [text for link in node.css("a, li") if (text := (link.text() or "").strip())]
+        if names:
+            return _dedupe_trail(names)
 
     return []
+
+
+def _dedupe_trail(names: list[str]) -> list[str]:
+    """Drop the repeats that nested `li > a` markup creates, keeping order."""
+    seen: set[str] = set()
+    return [name for name in names if not (name in seen or seen.add(name))][:10]
+
+
+# The smallest number of links that describes a *path* rather than a single reference.
+MIN_TRAIL_LINKS = 2
+
+
+def _trail_by_path_prefix(tree: HTMLParser, canonical: str | None) -> list[str]:
+    #Find a breadcrumb by the one thing every breadcrumb has, in any language.
+    if not canonical:
+        return []
+    segments = [segment for segment in _url_path(canonical).split("/") if segment]
+    if len(segments) < MIN_TRAIL_LINKS:
+        return []
+
+    ancestors = ["/" + "/".join(segments[:depth]) for depth in range(1, len(segments))]
+
+    best: list[str] = []
+    for container in tree.css("nav, ol, ul"):
+        if images.in_skipped_region(container):
+            continue
+        matched: list[tuple[int, str]] = []
+        for link in container.css("a[href]"):
+            path = _url_path(link.attributes.get("href")).rstrip("/")
+            if path in ancestors and (text := (link.text() or "").strip()):
+                matched.append((ancestors.index(path), text))
+        # Strictly increasing depth: a trail, not a block that happens to hold
+        # several ancestor links.
+        depths = [depth for depth, _ in matched]
+        if len(matched) >= MIN_TRAIL_LINKS and depths == sorted(set(depths)):
+            if len(matched) > len(best):
+                best = [text for _, text in matched]
+
+    return _dedupe_trail(best) if best else []
 
 
 # --------------------------------------------------------------------------------
@@ -363,34 +430,7 @@ def _parse_breadcrumbs(structured: list[dict[str, Any]], tree: HTMLParser) -> li
 
 
 def _select_subtrees(blobs: list[Any]) -> list[dict[str, Any]]:
-    """Select the product-shaped subtrees to forward to the model, within budget.
-
-    This is the hardest part of the module and the one that matters most: several real
-    PDPs put their price, images, and full variant matrix *only* in a framework state
-    blob, with no JSON-LD at all. Those blobs run to 100-450KB, far too large to
-    forward to a model - so we prune.
-
-    The rule is: KEEP THE LARGEST COHERENT SUBTREE THAT FITS THE BUDGET.
-
-      1. Find JSON blobs by framework convention. Those conventions belong to
-         Next.js/Redux/Apollo, not to any merchant.
-      2. Score object subtrees on product-likeness using generic commerce field names
-         (`price`, `name`, `sku`) - vocabulary shared across the whole industry.
-      3. Denoise a qualifying subtree, then keep it WHOLE if it fits. Coherence
-         matters enormously: real state blobs are normalised relational graphs where a
-         SKU references its price and images by foreign key into sibling arrays.
-         Splitting that apart destroys the only thing that makes the variants
-         recoverable, so we hand the model the whole structure and let it resolve the
-         references.
-      4. Only if a subtree cannot fit do we decompose it into its qualifying children.
-         If decomposition yields nothing, keep the denoised parent anyway - something
-         beats nothing, and this case is exactly the page that has no JSON-LD.
-
-    We never navigate to a known key path, and we never branch on a domain.
-
-    Known limitation: variant recovery from foreign-key-joined state is partial. That
-    is a deliberate, documented trade-off, not an oversight.
-    """
+    # Pick the product shaped subtrees to send to the model, within budget.
     collected: list[dict[str, Any]] = []
     for blob in blobs:
         _collect_subtrees(blob, collected)
@@ -418,15 +458,7 @@ def _select_subtrees(blobs: list[Any]) -> list[dict[str, Any]]:
 
 
 def _find_json_blobs(html: str) -> list[Any]:
-    """Locate parsed JSON payloads embedded in the page.
-
-    Two generic mechanisms:
-      - `<script type="application/json">` bodies, how Next.js, Nuxt, and Remix ship
-        server-rendered state.
-      - `window.SOMETHING = {...}` assignments, the older SSR convention.
-
-    Both are framework conventions. Neither encodes which merchant we are on.
-    """
+    # Find JSON payloads embedded in the page.
     blobs: list[Any] = []
 
     for match in re.finditer(
@@ -450,12 +482,7 @@ def _find_json_blobs(html: str) -> list[Any]:
 
 
 def _brace_match(text: str, start: int) -> Any | None:
-    """Parse one JSON value beginning at `start` by matching brackets.
-
-    Tracks string state and backslash escapes so braces inside string literals do not
-    corrupt the depth count. Returns None if the value is unterminated or is not valid
-    JSON (a JS object literal with unquoted keys, for instance).
-    """
+    # Read one JSON value starting at `start` by matching brackets.
     if text[start] not in "{[":
         return None
 
@@ -490,16 +517,7 @@ def _brace_match(text: str, start: int) -> Any | None:
     return None
 
 
-# Generic commerce field-name vocabulary. These are ordinary words used by essentially
-# every ecommerce framework and by the schema.org vocabulary itself; they identify no
-# particular merchant. This is the closest the module comes to the compliance line and
-# it stays on the right side of it: we match field *names* that are industry-standard,
-# never a path, a domain, or a CSS class.
-# An optional leading qualifier absorbs the camelCase and snake_case compounds that
-# every framework produces - `currentPrice`, `colorDescription`, `product_name` - so a
-# record is recognised by the *kind* of field it carries rather than by an exact
-# spelling. Without this, records whose price field is named `prices` or whose only
-# label is `colorDescription` are invisible, which loses a real page's entire gallery.
+# Generic commerce field-name vocabulary. 
 _PRICE_KEYS = re.compile(r"^[a-z]*_?(price|prices|amount|value|cost)$", re.I)
 _NAME_KEYS = re.compile(r"^[a-z]*_?(name|title|label|description)s?$", re.I)
 _ID_KEYS = re.compile(
@@ -508,13 +526,12 @@ _ID_KEYS = re.compile(
     re.I,
 )
 _OPTION_KEYS = re.compile(
-    r"^(option|options|variant|variants|attribute|attributes|selection|swatch|choices|skus)$",
+    r"^(option|options|variant|variants|attribute|attributes|selection|swatch|"
+    r"choices|choice|answers|values|skus)$",
     re.I,
 )
 
-# Keys whose contents are never product data. Dropping these is how an oversized
-# subtree is shrunk without losing product information - reviews, Q&A, analytics
-# payloads, and experiment buckets routinely account for most of a state blob's bulk.
+# Keys whose contents are usually not product data. 
 _NOISE_KEYS = re.compile(
     r"(analytic|telemetr|tracking|gtm|ga4|experiment|abtest|session|csrf|nonce|"
     r"feature_?flag|metrics|review|question|recommend|seo|html|markup|script|"
@@ -524,10 +541,7 @@ _NOISE_KEYS = re.compile(
 
 
 def _collect_subtrees(node: Any, out: list[dict[str, Any]], depth: int = 0) -> None:
-    """Recursively collect product-shaped subtrees, preferring coherent wholes.
-
-    See `_select_subtrees` for the rationale behind the keep/decompose rule.
-    """
+    """Walk the blob and collect product shaped subtrees, whole ones first."""
     if depth > 12:
         return
 
@@ -560,21 +574,39 @@ def _collect_subtrees(node: Any, out: list[dict[str, Any]], depth: int = 0) -> N
         _collect_subtrees(child, out, depth + 1)
 
 
-def _denoise(node: Any, depth: int = 0, max_string: int = MAX_STRING_CHARS) -> Any:
-    """Strip non-product bulk from a subtree without losing product structure.
+def _carries_options(node: Any, depth: int = 0) -> bool:
+    #This guards the cleanup step, so a configurator built out of questions and answers does not get deleted as noise.
 
-    Removes keys matching the generic noise vocabulary, truncates long strings
-    (invariably marketing HTML rather than data), and caps very long arrays. The
-    relational shape - which records exist and how they reference each other - is
-    preserved, because that is what makes variants recoverable.
-    """
+    if depth > 4:
+        return False
+
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(key, str) and _OPTION_KEYS.match(key) and _is_record_array(value):
+                return True
+            if _carries_options(value, depth + 1):
+                return True
+        return False
+
+    if isinstance(node, list):
+        return any(_carries_options(child, depth + 1) for child in node[:20])
+
+    return False
+
+
+def _denoise(node: Any, depth: int = 0, max_string: int = MAX_STRING_CHARS) -> Any:
+    # Strip the bulk out of a subtree without losing product structure.
     if depth > 12:
         return None
 
     if isinstance(node, dict):
         result = {}
         for key, value in node.items():
-            if isinstance(key, str) and _NOISE_KEYS.search(key):
+            if (
+                isinstance(key, str)
+                and _NOISE_KEYS.search(key)
+                and not _carries_options(value)
+            ):
                 continue
             child = _denoise(value, depth + 1, max_string)
             if child is not None and child != {} and child != []:
@@ -592,7 +624,7 @@ def _denoise(node: Any, depth: int = 0, max_string: int = MAX_STRING_CHARS) -> A
 
 
 def _serialised_size(node: Any) -> int:
-    """Size of a subtree once serialised, as a proxy for its token cost."""
+    #How big a subtree is once serialised. A rough stand in for token cost.
     try:
         return len(json.dumps(node, default=str))
     except (TypeError, ValueError):
@@ -600,12 +632,7 @@ def _serialised_size(node: Any) -> int:
 
 
 def _is_product_shaped(node: dict[str, Any]) -> bool:
-    """Decide whether one object looks like a product or variant record.
-
-    Purely structural: a name-like string alongside a price-like number or a commerce
-    identifier, or a named object enumerating a homogeneous set of option records. No
-    merchant, domain, or category knowledge is involved.
-    """
+    #Decide whether an object looks like a product or a variant record.
     has_name = has_price = has_id = has_option_table = False
 
     for key, value in node.items():
@@ -626,11 +653,7 @@ def _is_product_shaped(node: dict[str, Any]) -> bool:
 
 
 def _is_price_like(value: Any) -> bool:
-    """Whether a value could plausibly be a price.
-
-    Accepts numbers and numeric strings in a sane commerce range. The upper bound
-    rejects timestamps and numeric IDs that happen to sit under a `value` key.
-    """
+    #Could this value be a price?
     if isinstance(value, bool):  # bool subclasses int; exclude explicitly
         return False
     if isinstance(value, (int, float)):
@@ -645,14 +668,12 @@ def _is_price_like(value: Any) -> bool:
 
 
 def _is_record_array(value: Any) -> bool:
-    """Whether a value is a homogeneous array of records - i.e. an option table."""
+    #Is this a list of similar records, meaning an option table?
     if not isinstance(value, list) or len(value) < 2:
         return False
     dicts = [v for v in value if isinstance(v, dict)]
     if len(dicts) < 2:
         return False
-    # Homogeneous means the first two records share most of their keys. That is what
-    # distinguishes a data table from an incidental list of mixed objects.
     first, second = set(dicts[0].keys()), set(dicts[1].keys())
     if not first or not second:
         return False
@@ -665,21 +686,7 @@ def _is_record_array(value: Any) -> bool:
 
 
 def _harvest_text_blocks(tree: HTMLParser, meta: dict[str, str]) -> list[str]:
-    """Collect visible text, ranked so main product content comes first.
-
-    Needed because some PDPs state their price only in rendered markup, with no
-    machine-readable copy anywhere on the page. But visible text is also where
-    cross-sell and recommendation modules live, and those carry *other products'*
-    names and prices - a naive text scrape invites the model to describe the wrong
-    product entirely.
-
-    Two generic defences, neither using a selector tied to a merchant:
-
-      1. Drop link-farm containers (see `_mark_link_farms`).
-      2. Rank by proximity to the title. Blocks sharing a closer DOM ancestor with the
-         element containing `og:title` are likelier to belong to the main product
-         region, so they survive the budget cut while distant blocks do not.
-    """
+    #Collect visible text, with the main product content ranked first.
     body = tree.css_first("body")
     if body is None:
         return []
@@ -698,8 +705,7 @@ def _harvest_text_blocks(tree: HTMLParser, meta: dict[str, str]) -> list[str]:
         text = _normalise(node.text(deep=True, separator=" ") or "")
         if not text or text in seen:
             continue
-        # Truncate rather than drop: a long block is usually the product description,
-        # and discarding it outright would lose the best description on the page.
+        # Truncate rather than drop
         if len(text) > MAX_TEXT_BLOCK_CHARS:
             text = text[:MAX_TEXT_BLOCK_CHARS] + "..."
             if text in seen:
@@ -713,30 +719,8 @@ def _harvest_text_blocks(tree: HTMLParser, meta: dict[str, str]) -> list[str]:
 
 
 def _mark_link_farms(tree: HTMLParser, canonical: str | None) -> None:
-    """Mark containers that are navigation/recommendation regions, not content.
+    #Mark containers that are nav or recommendation strips rather than content.
 
-    Structural rule: LINK DENSITY. A region where most of the visible text is itself
-    link text, pointing at three or more distinct other pages, is a list of other
-    things - a menu, a carousel, a "you may also like" strip. A product body is mostly
-    prose with a few links (size guide, review anchors), so its density is low.
-
-    Density rather than a raw link count is essential. Counting links alone marks any
-    outer container that merely *encloses* the site header, which on a real PDP is
-    nearly every wrapper on the page - that cascades until the entire document is
-    suppressed. Density is self-limiting, because a container large enough to hold the
-    product description is diluted by that description's text.
-
-    This is a property of the DOM that holds on any site, which is what lets it defend
-    against cross-sell contamination without naming a merchant or a CSS class. One of
-    the provided pages carries a cross-sell block with a different product's name and
-    price, and another exposes `srcset` entries for an entirely different SKU.
-
-    Regions are marked with an attribute ON THE TREE rather than collected into a set
-    of node ids. selectolax hands out a fresh Python wrapper on every tree access, so
-    `id(node)` is not a stable identity: the ids are freed as soon as the wrappers go
-    out of scope and are then reused by unrelated nodes, which silently misclassifies
-    most of the page. The tree itself is the only durable place to record this.
-    """
     canonical_path = _url_path(canonical)
 
     for node in tree.css("ul, ol, nav, section, aside, div"):
@@ -762,7 +746,7 @@ def _mark_link_farms(tree: HTMLParser, canonical: str | None) -> None:
 
 
 def _url_path(url: str | None) -> str:
-    """Reduce a URL to its path, for comparing 'is this the same page'."""
+    #Cut a URL down to its path, so we can ask if two links are the same page.
     if not url:
         return ""
     stripped = re.sub(r"^https?://[^/]+", "", url)
@@ -770,19 +754,8 @@ def _url_path(url: str | None) -> str:
 
 
 def _mark_title_ancestors(tree: HTMLParser, meta: dict[str, str]) -> int:
-    """Mark the ancestors of the element rendering the page title, nearest first.
+    #Mark the ancestors of the element showing the page title, nearest first.
 
-    This is the anchor for proximity ranking. The title element is located by matching
-    the text of `og:title` (a standard) rather than by looking for an `<h1>`, because
-    a real PDP in the provided data uses its only `<h1>` for a breadcrumb -
-    heading-based heuristics are not dependable across sites.
-
-    Like `_mark_link_farms`, the chain is recorded as an attribute on the tree rather
-    than as node ids, because selectolax node identity is not stable across accesses.
-
-    Returns:
-        The chain length, so scores can be normalised. Zero if no title was found.
-    """
     title = meta.get("og:title") or meta.get("title")
     if not title:
         return 0
@@ -812,13 +785,7 @@ def _mark_title_ancestors(tree: HTMLParser, meta: dict[str, str]) -> int:
 
 
 def _proximity_score(node, chain_length: int) -> int:
-    """Score a node by how closely it shares a DOM ancestor with the title element.
-
-    A higher score means the node sits in the same region of the page as the product
-    title - a generic structural proxy for "part of the main product block". Walking
-    up from the node, the first marked ancestor found is the nearest common ancestor
-    with the title, and a smaller recorded depth means a tighter relationship.
-    """
+    #Score a node by how close its ancestors are to the title element.
     if chain_length == 0:
         return 0
 
@@ -834,23 +801,282 @@ def _proximity_score(node, chain_length: int) -> int:
 
 
 def _normalise(text: str) -> str:
-    """Collapse whitespace so text blocks compare and deduplicate cleanly."""
+    #Collapse whitespace so text blocks compare and dedupe cleanly.
     return re.sub(r"\s+", " ", text).strip()
 
 
 # --------------------------------------------------------------------------------
-# 5. video
+# 5. the variant graph
+# --------------------------------------------------------------------------------
+
+# Everything below matches on shape and on generic commerce vocabulary. No key path,
+# no merchant, no CDN.
+
+MAX_GRAPH_VARIANTS = 300
+MIN_GRAPH_DIMENSIONS = 2
+
+# The identity of a record, so rows can be found again by the ids that reference them.
+_RECORD_ID_KEYS = re.compile(r"^(id|sku|code|key)$", re.I)
+# Where a SKU row says this configuration is bought. 
+_ROW_URL_KEYS = re.compile(r"^[a-z]*_?(url|uri|href|link|permalink|pdpurl|canonicalurl)$", re.I)
+# Fields on a SKU row that point at its imagery, its price, and its stock state.
+_MEDIA_REF_KEYS = re.compile(
+    r"^(media|image|images|img|photo|photos|picture|pictures|asset|assets|"
+    r"gallery|shot|shots)(_?ids?)?$",
+    re.I,
+)
+_PRICE_REF_KEYS = re.compile(r"^(price|prices|pricing|cost)(_?ids?)?$", re.I)
+_STOCK_KEYS = re.compile(
+    r"^(availability|available|in_?stock|stock|inventory|inventory_?status|status)$", re.I
+)
+_AMOUNT_KEYS = re.compile(r"^(amount|value|price|current|now|sale|final)$", re.I)
+_URL_VALUE_KEYS = re.compile(r"^(src|url|href|uri|source|link|path)$", re.I)
+
+_IN_STOCK = re.compile(r"^(in ?stock|instock|in|available|purchasable|true|yes|y)$", re.I)
+_OUT_OF_STOCK = re.compile(
+    r"^(out ?of ?stock|outofstock|out|sold ?out|soldout|unavailable|discontinued|"
+    r"backorder(ed)?|false|no|n)$",
+    re.I,
+)
+
+
+def harvest_variant_graph(blobs: list[Any], base_url: str | None = None) -> list[VariantRecord]:
+    #Join a page's option, SKU, media and price tables into one row per variant.
+
+    groups = [group for blob in blobs for group in _option_tables(blob)]
+    if len(groups) < MIN_GRAPH_DIMENSIONS:
+        return []
+
+    # identifier -> {dimension: choice}
+    sku_to_options: dict[str, dict[str, str]] = {}
+    for dimension, choices in groups:
+        for choice, identifiers in choices:
+            for identifier in identifiers:
+                sku_to_options.setdefault(identifier, {})[dimension] = choice
+
+    # Only now, once there is something to join against, is it worth indexing the page.
+    records_by_id: dict[str, dict[str, Any]] = {}
+    for blob in blobs:
+        _index_records(blob, records_by_id)
+
+    variants: list[VariantRecord] = []
+    for sku, options in sku_to_options.items():
+        if len(options) < MIN_GRAPH_DIMENSIONS:
+            continue
+
+        row = records_by_id.get(sku) or {}
+        variants.append(
+            VariantRecord(
+                sku=sku,
+                options=options,
+                image_urls=_resolve_media(row, records_by_id, base_url),
+                amount=_resolve_amount(row, records_by_id),
+                available=_resolve_availability(row),
+                url=_resolve_url(row, base_url),
+            )
+        )
+
+    return variants[:MAX_GRAPH_VARIANTS]
+
+
+def _resolve_url(row: dict[str, Any], base_url: str | None) -> str | None:
+    #The buy URL a SKU row names, resolved against the page.
+    for key, value in row.items():
+        if isinstance(key, str) and _ROW_URL_KEYS.match(key) and isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                return urljoin(base_url, candidate) if base_url else candidate
+    return None
+
+
+def _option_tables(
+    node: Any, depth: int = 0
+) -> list[tuple[str, list[tuple[str, list[str]]]]]:
+    #Find option tables, as (dimension, [(choice, ids)]).
+    if depth > 8:
+        return []
+
+    if isinstance(node, list):
+        return [table for child in node for table in _option_tables(child, depth + 1)]
+
+    if not isinstance(node, dict):
+        return []
+
+    found: list[tuple[str, list[tuple[str, list[str]]]]] = []
+    dimension = _label_of(node)
+
+    for key, value in node.items():
+        if not (isinstance(key, str) and _OPTION_KEYS.match(key) and isinstance(value, list)):
+            continue
+
+        choices: list[tuple[str, list[str]]] = []
+        for entry in value:
+            if not isinstance(entry, dict):
+                continue
+            choice = _label_of(entry)
+            identifiers = _identifier_list(entry)
+            if choice and identifiers:
+                choices.append((choice, identifiers))
+
+        if dimension and choices:
+            found.append((dimension, choices))
+
+    for value in node.values():
+        found.extend(_option_tables(value, depth + 1))
+
+    return found
+
+
+def _label_of(record: dict[str, Any]) -> str | None:
+    #The readable name of a record, if it has one.
+    for key in ("title", "name", "label", "displayName", "text"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _identifier_list(entry: dict[str, Any]) -> list[str]:
+    #The item ids one option choice applies to.
+    for key, value in entry.items():
+        if not (isinstance(key, str) and _ID_LIST_KEYS.match(key) and isinstance(value, list)):
+            continue
+        identifiers = [
+            str(item) for item in value if isinstance(item, (str, int)) and str(item).strip()
+        ]
+        if identifiers:
+            return identifiers
+    return []
+
+
+_ID_LIST_KEYS = re.compile(
+    r"^(skus|sku_?ids|ids|item_?ids|variant_?ids|product_?ids|member_?ids)$", re.I
+)
+
+
+def _index_records(node: Any, out: dict[str, dict[str, Any]], depth: int = 0) -> None:
+    #Index every record that has an id, so references can be followed.
+    if depth > 12:
+        return
+
+    if isinstance(node, list):
+        for child in node:
+            _index_records(child, out, depth + 1)
+        return
+
+    if not isinstance(node, dict):
+        return
+
+    for key, value in node.items():
+        if isinstance(key, str) and _RECORD_ID_KEYS.match(key):
+            if isinstance(value, (str, int)) and str(value).strip():
+                out.setdefault(str(value), node)
+                break
+
+    for value in node.values():
+        _index_records(value, out, depth + 1)
+
+
+def _resolve_media(
+    row: dict[str, Any], records: dict[str, dict[str, Any]], base_url: str | None
+) -> list[str]:
+    #Follow a SKU row's media references out to absolute image URLs.
+    urls: list[str] = []
+
+    for key, value in row.items():
+        if not (isinstance(key, str) and _MEDIA_REF_KEYS.match(key)):
+            continue
+        for reference in value if isinstance(value, list) else [value]:
+            url = _dereference_url(reference, records)
+            absolute = images._absolutise(url, base_url) if url else None
+            if absolute and absolute not in urls:
+                urls.append(absolute)
+
+    return urls
+
+
+def _dereference_url(reference: Any, records: dict[str, dict[str, Any]]) -> str | None:
+    #Turn one media reference into a URL. It may be a record, a URL, or an id.
+    if isinstance(reference, dict):
+        return _url_field(reference)
+
+    if not isinstance(reference, (str, int)):
+        return None
+
+    value = str(reference).strip()
+    if value.startswith(("http", "//", "/")):
+        return value
+
+    target = records.get(value)
+    return _url_field(target) if target else None
+
+
+def _url_field(record: dict[str, Any]) -> str | None:
+    #The URL a media record exposes.#
+    for key, value in record.items():
+        if not (isinstance(key, str) and _URL_VALUE_KEYS.match(key)):
+            continue
+        if isinstance(value, str) and value.strip().startswith(("http", "//", "/")):
+            return value.strip()
+    return None
+
+
+def _resolve_amount(row: dict[str, Any], records: dict[str, dict[str, Any]]) -> float | None:
+    #Follow a SKU row's price reference to a number.
+    for key, value in row.items():
+        if not (isinstance(key, str) and _PRICE_REF_KEYS.match(key)):
+            continue
+
+        target: Any = value
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            if isinstance(value, str) and not value.replace(".", "", 1).isdigit():
+                target = records.get(value)
+            elif _is_price_like(value):
+                return float(value)
+
+        if isinstance(target, dict):
+            for inner_key, inner_value in target.items():
+                if (
+                    isinstance(inner_key, str)
+                    and _AMOUNT_KEYS.match(inner_key)
+                    and _is_price_like(inner_value)
+                ):
+                    return float(inner_value)
+
+    return None
+
+
+def _resolve_availability(row: dict[str, Any]) -> bool | None:
+    #Read a SKU row's stock state, leaving it unknown if the page is silent.
+    for key, value in row.items():
+        if not (isinstance(key, str) and _STOCK_KEYS.match(key)):
+            continue
+
+        candidates = (
+            list(value.values()) if isinstance(value, dict) else [value]
+        )
+        for candidate in candidates:
+            if isinstance(candidate, bool):
+                return candidate
+            if isinstance(candidate, str):
+                text = candidate.strip()
+                if _IN_STOCK.match(text):
+                    return True
+                if _OUT_OF_STOCK.match(text):
+                    return False
+
+    return None
+
+
+# --------------------------------------------------------------------------------
+# 6. video
 # --------------------------------------------------------------------------------
 
 
 def _harvest_videos(
     tree: HTMLParser, structured: list[dict[str, Any]], meta: dict[str, str]
 ) -> list[str]:
-    """Collect video URLs from schema.org, OpenGraph, and HTML media elements.
-
-    All three sources are standards-defined, so this needs no interpretation and never
-    reaches a model.
-    """
+    #Collect video URLs from schema.org, OpenGraph and HTML media tags.
     videos: list[str] = []
 
     for item in structured:

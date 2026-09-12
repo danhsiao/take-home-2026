@@ -1,26 +1,7 @@
-"""The stateless worker primitive: raw HTML in, ExtractionResult out.
+"""The worker: HTML in, ExtractionResult out.
 
-This module owns two things:
-
-  1. FACTS DERIVATION - reading high-confidence values out of schema.org and
-     OpenGraph, where the meaning of a field is fixed by a specification rather than
-     guessed. This is the only place in the pipeline that assigns semantics
-     deterministically, and it is legitimate precisely because the semantics were
-     defined by someone else.
-
-  2. ORCHESTRATION AND POLICY - running the stages in order, deciding what to do with
-     each validation issue, and assembling the final `Product`.
-
-The central rule of the merge is FACTS BEAT MODEL OUTPUT. If schema.org stated a
-price, that is the price; the model's opinion is discarded (and the disagreement
-logged, because a persistent gap between the two is a useful drift signal). A model
-can fill gaps. It cannot overwrite the page's own machine-readable claims. That single
-rule does more to prevent hallucinated output than any amount of prompt engineering.
-
-Nothing here raises to the caller. Every failure - a transport error, an unfindable
-price, an invalid category - becomes a structured `ExtractionResult` with the reason
-attached, because a batch of 50 million products cannot afford to stop at the first
-malformed page.
+It does two jobs. It reads the values a published standard already stated, and it
+runs the stages, applies the merge rules and builds the final Product.
 """
 
 import hashlib
@@ -30,6 +11,7 @@ import re
 from typing import Any
 
 import extract
+import images
 import normalize
 import taxonomy
 import validate
@@ -52,20 +34,7 @@ _IN_STOCK = {"instock", "instoreonly", "onlineonly", "limitedavailability", "pre
 
 
 async def run_html(html: str, url: str | None = None) -> ExtractionResult:
-    """Extract one product from one page. The unit of work the whole system scales by.
-
-    Deliberately stateless and side-effect free: no database, no queue, no shared
-    cache. That is what lets the production design in the README wrap it in workers
-    and horizontal scaling without touching this code.
-
-    Args:
-        html: raw page source.
-        url: the page URL, if known.
-
-    Returns:
-        An ExtractionResult. `product` is None when a required field could not be
-        resolved, with the reason in `errors`.
-    """
+    # Extract one product from one page. This is the unit the system scales by.
     result = ExtractionResult(source=url)
 
     # --- Stage 1: deterministic harvest -------------------------------------------
@@ -73,11 +42,6 @@ async def run_html(html: str, url: str | None = None) -> ExtractionResult:
     facts = derive_facts(evidence)
 
     # --- Stage 2: deterministic taxonomy retrieval --------------------------------
-    # `fallback_text` matters for generality: a page may carry no JSON-LD, no
-    # breadcrumbs and no microdata at all, which is an ordinary input rather than a
-    # broken one. Without a fallback such a page would be rejected here, before
-    # inference had a chance to read anything - failing on exactly the sparse pages
-    # the model is most needed for.
     query = taxonomy.build_query(
         name=facts.name,
         description=facts.description,
@@ -114,7 +78,7 @@ async def run_html(html: str, url: str | None = None) -> ExtractionResult:
             # The repair declined, meaning no retrieved entry actually describes this
             # product. We stop here rather than keep the first guess. `Product`
             # requires a category and offers no "unknown" value, so a product whose
-            # category cannot be determined genuinely cannot be represented - and a
+            # category we cannot work out genuinely cannot be represented. And a
             # category that is merely valid, rather than correct, is the worst
             # possible outcome, since nothing downstream can detect it.
             result.errors.append(
@@ -136,14 +100,8 @@ async def run_html(html: str, url: str | None = None) -> ExtractionResult:
 
 
 def derive_facts(evidence: PageEvidence) -> DeterministicFacts:
-    """Read high-confidence values from standards-defined evidence.
+    # Read the high confidence values out of standards based evidence.
 
-    Only schema.org, microdata, and OpenGraph are consulted. Each of those defines
-    what its fields mean, so reading them is interpretation-free. Visible text is
-    deliberately not mined here - inferring "this string is the brand" from unlabelled
-    markup is a guess, and guesses belong to the model, which at least reports its
-    uncertainty.
-    """
     facts = DeterministicFacts()
 
     products = extract.find_typed(evidence.structured, "Product", "ProductGroup")
@@ -171,21 +129,18 @@ def derive_facts(evidence: PageEvidence) -> DeterministicFacts:
     facts.image_urls = [asset.url for asset in evidence.images]
     facts.video_url = evidence.videos[0] if evidence.videos else None
 
-    facts.variants = _variants_from_structured(products)
+    facts.variants = (
+        _variants_from_structured(products)
+        or _variants_from_graph(evidence, facts.price)
+        or _variants_from_controls(evidence)
+    )
 
     return facts
 
 
 def _variants_from_structured(products: list[dict[str, Any]]) -> list[Variant]:
-    """Build variants from a schema.org ProductGroup's `hasVariant` entries.
+    # Build variants from a schema.org ProductGroup's `hasVariant` list.
 
-    This is the best case available: a `ProductGroup` declares `variesBy` and then
-    enumerates real, individually-priced Products. When a page provides this, variant
-    extraction needs no model at all, and the result is exact rather than inferred.
-
-    `variesBy` names the dimensions as schema.org property URLs (".../color"), so the
-    dimension labels come from the specification rather than from our own vocabulary.
-    """
     variants: list[Variant] = []
 
     for group in products:
@@ -231,12 +186,80 @@ def _variants_from_structured(products: list[dict[str, Any]]) -> list[Variant]:
     return variants
 
 
-def _offer_price(offers: Any) -> Price | None:
-    """Read a Price from a schema.org `offers` value.
+def _variants_from_graph(evidence: PageEvidence, price: Price | None) -> list[Variant]:
+    # Turn the page's joined variant graph into Variants.
 
-    `offers` may be a single Offer, a list of Offers, or an AggregateOffer. When there
-    are several, the lowest is taken, matching the "from $X" convention shoppers see.
-    """
+    currency = price.currency if price else None
+
+    return [
+        Variant(
+            options=record.options,
+            sku=record.sku,
+            price=(
+                Price(price=record.amount, currency=currency)
+                if record.amount is not None and currency
+                else None
+            ),
+            available=record.available,
+            image_urls=images.align_to_assets(record.image_urls, evidence.images),
+            url=record.url,
+        )
+        for record in evidence.variant_graph
+    ]
+
+
+def _variants_from_controls(evidence: PageEvidence) -> list[Variant]:
+    # Build variants from the option groups the rendered page shows.
+
+    # A page's controls are not all product options. 
+    groups = [
+        group
+        for group in evidence.option_groups
+        if len(group.values) > 1
+        and any(
+            value.image_url or value.url or value.available is not None
+            for value in group.values
+        )
+    ]
+    if not groups:
+        return []
+    inside = [group for group in groups if group.title_depth is not None]
+    groups = inside or groups
+
+    primary = max(groups, key=lambda group: len(group.values))
+
+    pinned: dict[str, str] = {}
+    for group in evidence.option_groups:
+        if group is primary or not group.name:
+            continue
+        chosen = next((value for value in group.values if value.selected), None)
+        if chosen:
+            pinned[group.name] = chosen.label
+
+    dimension = primary.name or "Option"
+    variants: list[Variant] = []
+    for value in primary.values:
+        options = dict(pinned)
+        options[dimension] = value.label
+        variants.append(
+            Variant(
+                options=options,
+                available=value.available,
+                # The swatch is this configuration's own photograph. It is a small
+                # rendition, so it is restated at the best resolution the page exposed
+                # for that same asset, exactly as the graph path does.
+                image_urls=images.align_to_assets(
+                    [value.image_url] if value.image_url else [], evidence.images
+                ),
+                url=value.url,
+            )
+        )
+    return variants
+
+
+def _offer_price(offers: Any) -> Price | None:
+    # Read a Price out of a schema.org `offers` value.
+
     if isinstance(offers, list):
         prices = [p for p in (_offer_price(o) for o in offers) if p]
         return min(prices, key=lambda p: p.price) if prices else None
@@ -256,7 +279,7 @@ def _offer_price(offers: Any) -> Price | None:
 
     # `compare_at_price` is deliberately NOT derived from `highPrice`. In an
     # AggregateOffer, highPrice is the top of a *range across variants*, not the
-    # pre-sale price of this item - treating it as a former price invents a discount
+    # old price of this item. Treating it as one invents a discount
     # wherever a product simply has a large size costing more. schema.org has no
     # standard former-price field, so that value is left to the model, which can read
     # an explicit "was" price off the page.
@@ -267,7 +290,7 @@ def _offer_price(offers: Any) -> Price | None:
 
 
 def _offer_url(offers: Any) -> str | None:
-    """Read a purchase URL from a schema.org `offers` value."""
+    # Read a buy URL out of a schema.org `offers` value.
     if isinstance(offers, list):
         offers = offers[0] if offers else None
     if isinstance(offers, dict):
@@ -276,11 +299,7 @@ def _offer_url(offers: Any) -> str | None:
 
 
 def _availability(offers: Any) -> bool | None:
-    """Interpret schema.org availability as a simple boolean.
-
-    Returns None rather than False when nothing is stated: "the page did not say" and
-    "the page said out of stock" are different facts and must not be conflated.
-    """
+    # Turn schema.org availability into a plain boolean.
     if isinstance(offers, list):
         offers = offers[0] if offers else None
     if not isinstance(offers, dict):
@@ -293,7 +312,7 @@ def _availability(offers: Any) -> bool | None:
 
 
 def _microdata_price(evidence: PageEvidence) -> Price | None:
-    """Recover a price from microdata, for pages using the older serialisation."""
+    # Recover a price from microdata, for pages using the older format.
     for scope in evidence.microdata:
         amount = _as_float(scope.get("price"))
         currency = _as_text(scope.get("priceCurrency"))
@@ -303,10 +322,7 @@ def _microdata_price(evidence: PageEvidence) -> Price | None:
 
 
 def _declared_category(evidence: PageEvidence) -> str | None:
-    """The merchant's own category string, when schema.org carries one.
-
-    A strong retrieval signal, and standards-defined rather than scraped.
-    """
+    # The shop's own category string, when schema.org carries one.
     for item in extract.find_typed(evidence.structured, "Product", "ProductGroup"):
         value = _as_text(item.get("category"))
         if value:
@@ -315,7 +331,7 @@ def _declared_category(evidence: PageEvidence) -> str | None:
 
 
 def _brand_name(brand: Any) -> str | None:
-    """Read a brand name from schema.org, which allows a string or a Brand object."""
+    # Read a brand name, which schema.org allows as a string or an object.
     if isinstance(brand, str):
         return brand.strip() or None
     if isinstance(brand, dict):
@@ -326,7 +342,7 @@ def _brand_name(brand: Any) -> str | None:
 
 
 def _first_gtin(item: dict[str, Any]) -> str | None:
-    """Read any GTIN variant schema.org defines (gtin, gtin8/12/13/14)."""
+    # Read any of the GTIN fields schema.org defines.
     for key in ("gtin", "gtin14", "gtin13", "gtin12", "gtin8"):
         value = _as_text(item.get(key))
         if value:
@@ -335,12 +351,7 @@ def _first_gtin(item: dict[str, Any]) -> str | None:
 
 
 def _as_text(value: Any) -> str | None:
-    """Coerce a schema.org value to clean text, tolerating lists and nested objects.
-
-    HTML entities are decoded because many sites entity-encode the contents of their
-    JSON-LD blocks even though the spec does not call for it, which otherwise leaks
-    literal `&amp;` into product names.
-    """
+    # Turn a schema.org value into clean text, coping with lists and objects.
     if isinstance(value, str):
         return html_module.unescape(value).strip() or None
     if isinstance(value, (int, float)):
@@ -353,7 +364,7 @@ def _as_text(value: Any) -> str | None:
 
 
 def _as_float(value: Any) -> float | None:
-    """Coerce a schema.org price value to a float, tolerating formatted strings."""
+    # Turn a schema.org price into a float, coping with formatted strings.
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -373,26 +384,14 @@ def _as_float(value: Any) -> float | None:
 
 
 def _needs_category_repair(issues: list[ValidationIssue]) -> bool:
-    """Whether the category warrants a second, cheap call."""
+    """Is the category bad enough to be worth a second, cheap call?"""
     return any(issue.code.startswith("category.") for issue in issues)
 
 
 def _apply_issue_policy(
     candidate: ProductCandidate, issues: list[ValidationIssue], result: ExtractionResult
 ) -> ProductCandidate:
-    """Act on validation findings: drop what is unsupported, record what is suspect.
-
-    The policy is deliberately asymmetric, because the right response depends on the
-    failure:
-
-      * An unsupported image URL or identifier is DROPPED. Re-asking the model would
-        resample the same distribution that produced the error; removing the
-        unverifiable value is both cheaper and strictly more correct.
-      * An ungrounded or malformed variant is DROPPED, with a warning. Better to
-        under-report variants than to publish combinations the page never offered.
-      * A duplicate variant is COLLAPSED.
-      * Warnings are recorded and counted, never acted on.
-    """
+    # Act on the validator's findings. Drop what is unsupported, log what is odd.
     dropped_variants: set[int] = set()
     dropped_images: set[tuple[int, str]] = set()
 
@@ -414,11 +413,7 @@ def _apply_issue_policy(
             dropped_images.add((index, issue.message.rsplit(": ", 1)[-1]))
             result.warnings.append(f"{issue.code}: {issue.message}")
         elif issue.code == "price.insane":
-            # Discard the incoherent price rather than record a fatal error. A
-            # structured price usually supersedes it anyway, and if none exists the
-            # product will fail cleanly as `field.unresolvable` during assembly -
-            # which is the honest outcome, and avoids reporting an error on a page
-            # that in fact extracted correctly.
+            # Discard the incoherent price rather than record a fatal error. 
             candidate.price = None
             result.warnings.append(f"{issue.code}: {issue.message}")
         else:
@@ -452,7 +447,7 @@ def _apply_issue_policy(
 
 
 def _variant_index(field: str) -> int | None:
-    """Recover the variant index from a validation issue's field path."""
+    # Pull the variant index back out of an issue's field path.
     if not field.startswith("variants["):
         return None
     try:
@@ -467,19 +462,7 @@ def _assemble(
     evidence: PageEvidence,
     result: ExtractionResult,
 ) -> Product | None:
-    """Merge deterministic facts with model output into the final Product.
-
-    Precedence is the whole point: for every field a standard could state, the
-    deterministic value wins and the model's is used only to fill a gap. Where the two
-    disagree on price, the disagreement is recorded - a persistent gap between what
-    schema.org says and what a model reads off the page is exactly the kind of drift
-    worth alerting on in production.
-
-    Returns None when a required field cannot be resolved. That is a real outcome, not
-    a defect: one of the provided pages states its price only in rendered markup, and
-    the honest response to an unfindable required value is to fail loudly rather than
-    let a model supply a plausible number.
-    """
+    #Merge the deterministic facts with the model output into the final Product.
     name = facts.name or candidate.name
     brand = facts.brand or candidate.brand
     description = candidate.description or facts.description
@@ -491,11 +474,8 @@ def _assemble(
             f"model read {candidate.price.price}; using structured data."
         )
 
-    # Variants from schema.org are exact; the model's are inferred. Prefer the former
-    # when a page provided them, and fall back to interpretation when it did not.
     variants = facts.variants or candidate.variants
 
-    # Colours are derived from variants where possible rather than asked for twice.
     colors = _colors_from(variants) or candidate.colors
 
     missing = [
@@ -535,25 +515,20 @@ def _assemble(
 
 
 def _colors_from(variants: list[Variant]) -> list[str]:
-    """Collect the distinct colour values named across variants.
-
-    Derived rather than requested separately, so that product-level colours cannot
-    contradict the variants they summarise.
-    """
+    # Collect the distinct colours named across the variants.
     colors: list[str] = []
     for variant in variants:
         for key, value in variant.options.items():
-            if key.strip().lower() in ("color", "colour") and value not in colors:
+            if _COLOR_DIMENSION.search(key) and value not in colors:
                 colors.append(value)
     return colors
 
 
-def product_id(url: str | None, name: str | None) -> str:
-    """A stable identifier for a product, used by the API and as a cache key.
+_COLOR_DIMENSION = re.compile(r"\bcolou?rs?\b", re.I)
 
-    Content-hashed rather than sequential so it is reproducible across runs and across
-    machines - the same page always yields the same id, which is what makes it usable
-    as the fingerprint for the caching strategy described in the README.
-    """
+
+def product_id(url: str | None, name: str | None) -> str:
+    #A stable id for a product, used by the API and as a cache key.
+
     basis = (url or name or "").strip().lower()
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]

@@ -20,6 +20,9 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+# The modules under test live at the repo root, not in a package. Without this,
+# `uv run pytest` cannot import them and only `python -m pytest` works.
+pythonpath = ["."]
 markers = [
     "golden: asserts against the cached extraction snapshot (requires running main.py first)",
 ]

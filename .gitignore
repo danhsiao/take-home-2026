@@ -1,6 +1,9 @@
 .env
 __pycache__/
-
+data/bestbuy.html
+data/homedepot.html
+data/target.html
+data/walmart.html
 uv.lock
 .venv/
 out/

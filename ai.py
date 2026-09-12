@@ -32,7 +32,7 @@ T = TypeVar("T", bound=BaseModel)
 
 @lru_cache
 def _get_client() -> AsyncOpenAI:
-    """Get cached AsyncOpenAI client configured for OpenRouter."""
+    """The cached AsyncOpenAI client, pointed at OpenRouter."""
     api_key = os.environ.get("OPEN_ROUTER_API_KEY")
     if not api_key:
         raise ValueError("OPEN_ROUTER_API_KEY not found in environment")
@@ -40,7 +40,7 @@ def _get_client() -> AsyncOpenAI:
 
 
 def _log_usage(response) -> None:
-    """Log token usage and cost extrapolation for 1M queries."""
+    """Log token usage and what the call would cost at 1M and 10M products."""
     usage = getattr(response, "usage", None)
     if usage is None:
         logger.warning("No usage data in response")
@@ -85,15 +85,7 @@ async def responses(
     text_format: type[T] | None = None,
     **kwargs,
 ) -> T | Any:
-    """
-    Call OpenRouter responses API with automatic token usage logging.
-
-    OpenAI Responses API: https://platform.openai.com/docs/api-reference/responses
-
-    @dev: The intention of this function is to be used as a wrapper around the OpenAI Responses API,
-    so the developer can view token usage and cost extrapolation of each query. If this
-    abstraction becomes cumbersome, you may remove it, but it is recommended to observe your token usage.
-    """
+    """Call the OpenRouter responses API and log what it cost."""
     client = _get_client()
 
     if text_format is not None:
